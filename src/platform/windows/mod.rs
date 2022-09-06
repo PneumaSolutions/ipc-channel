@@ -630,7 +630,7 @@ impl MessageReader {
                 handle: self.handle.take(),
                 ov: NoDebug(Box::new({
                     let mut overlapped: winapi::um::minwinbase::OVERLAPPED = mem::zeroed();
-                    // Create a manually reset event. The documentation for GetOverlappedResultEx
+                    // Create a manually reset event. The documentation for GetOverlappedResult
                     // states you must do this in the remarks section.
                     overlapped.hEvent = CreateEventA(ptr::null_mut(), TRUE, FALSE, ptr::null_mut());
                     Overlapped::new(overlapped)
@@ -751,6 +751,29 @@ impl MessageReader {
         Ok(())
     }
 
+    fn wait_for_async_result(&mut self, blocking_mode: BlockingMode) -> Result<(), WinError> {
+        unsafe {
+            let timeout = match blocking_mode {
+                BlockingMode::Blocking => winapi::um::winbase::INFINITE,
+                BlockingMode::Nonblocking => {
+                    return Ok(());
+                }
+                BlockingMode::Timeout(duration) => duration.as_millis().try_into().unwrap_or(winapi::um::winbase::INFINITE),
+            };
+            let result = winapi::um::synchapi::WaitForSingleObject(self.r#async.as_ref().unwrap().alias().ov.deref().hEvent, timeout);
+            if result == winapi::um::winbase::WAIT_FAILED {
+                let err = GetLastError();
+                return Err(WinError::from_system(err, "WaitForSingleObject"));
+            }
+            // Timeout has elapsed, so we must cancel the read operation before proceeding
+            if result == winapi::shared::winerror::WAIT_TIMEOUT {
+                self.cancel_io();
+                return Err(WinError::NoData);
+            }
+            Ok(())
+        }
+    }
+
     /// Attempt to conclude an already issued async read operation.
     ///
     /// If successful, the result will be ready for picking up by `get_message()`.
@@ -769,17 +792,14 @@ impl MessageReader {
     /// (Or the async read is aborted with `cancel_io()`.)
     fn fetch_async_result(&mut self, blocking_mode: BlockingMode) -> Result<(), WinError> {
         unsafe {
-            // Get the overlapped result, blocking if we need to.
+            // It's safe to bail without calling `notify_completion' if waiting
+            // fails, because that doesn't affect whether an async read
+            // is still in flight.
+            self.wait_for_async_result(blocking_mode)?;
             let mut nbytes: u32 = 0;
-            let timeout = match blocking_mode {
-                BlockingMode::Blocking => winapi::um::winbase::INFINITE,
-                BlockingMode::Nonblocking => 0,
-                BlockingMode::Timeout(duration) => duration.as_millis().try_into().unwrap_or(winapi::um::winbase::INFINITE),
-            };
-            let ok = winapi::um::ioapiset::GetOverlappedResultEx(self.r#async.as_ref().unwrap().alias().handle.as_raw(),
+            let ok = winapi::um::ioapiset::GetOverlappedResult(self.r#async.as_ref().unwrap().alias().handle.as_raw(),
                                                    &mut ***self.r#async.as_mut().unwrap().alias_mut().ov.deref_mut(),
                                                    &mut nbytes,
-                                                   timeout,
                                                    FALSE);
             winapi::um::synchapi::ResetEvent(self.r#async.as_mut().unwrap().alias_mut().ov.deref_mut().hEvent);
             let io_result = if ok == FALSE {
@@ -789,14 +809,9 @@ impl MessageReader {
                     // Inform the caller, while keeping the read in flight.
                     return Err(WinError::NoData);
                 }
-                // Timeout has elapsed, so we must cancel the read operation before proceeding
-                if err == winapi::shared::winerror::WAIT_TIMEOUT {
-                    self.cancel_io();
-                    return Err(WinError::NoData);
-                }
                 // We pass err through to notify_completion so
                 // that it can handle other errors.
-                Err(WinError::from_system(err, "GetOverlappedResultEx"))
+                Err(WinError::from_system(err, "GetOverlappedResult"))
             } else {
                 Ok(())
             };
