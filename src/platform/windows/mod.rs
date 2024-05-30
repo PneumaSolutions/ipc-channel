@@ -27,6 +27,7 @@ use std::ops::{Deref, DerefMut, RangeFrom};
 use std::ptr;
 use std::ptr::null_mut;
 use std::slice;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -103,8 +104,9 @@ pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver),WinError> {
     let pipe_id = make_pipe_id();
     let pipe_name = make_pipe_name(&pipe_id);
 
-    let receiver = OsIpcReceiver::new_named(&pipe_name)?;
+    let mut receiver = OsIpcReceiver::new_named(&pipe_name)?;
     let sender = OsIpcSender::connect_named(&pipe_name)?;
+    receiver.sender_pid_override = Some(Arc::clone(&sender.pid_override));
 
     Ok((sender, receiver))
 }
@@ -988,6 +990,8 @@ enum BlockingMode {
     Timeout(Duration),
 }
 
+type PidOverride = Arc<Mutex<Option<u32>>>;
+
 #[derive(Debug)]
 pub struct OsIpcReceiver {
     /// The receive handle and its associated state.
@@ -1001,6 +1005,7 @@ pub struct OsIpcReceiver {
     /// since the `consume()` method needs to move out the reader
     /// despite only getting a shared reference to `self`.
     reader: RefCell<MessageReader>,
+    sender_pid_override: Option<PidOverride>,
 }
 
 #[cfg(feature = "windows-shared-memory-equality")]
@@ -1014,6 +1019,7 @@ impl OsIpcReceiver {
     fn from_handle(handle: WinHandle) -> OsIpcReceiver {
         OsIpcReceiver {
             reader: RefCell::new(MessageReader::new(handle)),
+            sender_pid_override: None,
         }
     }
 
@@ -1036,6 +1042,7 @@ impl OsIpcReceiver {
 
             Ok(OsIpcReceiver {
                 reader: RefCell::new(MessageReader::new(WinHandle::new(handle))),
+                sender_pid_override: None,
             })
         }
     }
@@ -1051,7 +1058,9 @@ impl OsIpcReceiver {
     pub fn consume(&self) -> OsIpcReceiver {
         let mut reader = self.reader.borrow_mut();
         assert!(reader.r#async.is_none());
-        OsIpcReceiver::from_handle(reader.handle.take())
+        let mut result = OsIpcReceiver::from_handle(reader.handle.take());
+        result.sender_pid_override = self.sender_pid_override.as_ref().map(Arc::clone);
+        result
     }
 
     // This is only used for recv/try_recv/try_recv_timeout.  When this is added to an IpcReceiverSet, then
@@ -1170,6 +1179,7 @@ impl OsIpcReceiver {
 #[cfg_attr(feature = "windows-shared-memory-equality", derive(PartialEq))]
 pub struct OsIpcSender {
     handle: WinHandle,
+    pid_override: PidOverride,
     // Make sure this is `!Sync`, to match `mpsc::Sender`; and to discourage sharing references.
     //
     // (Rather, senders should just be cloned, as they are shared internally anyway --
@@ -1196,6 +1206,7 @@ impl OsIpcSender {
     fn from_handle(handle: WinHandle) -> OsIpcSender {
         OsIpcSender {
             handle: handle,
+            pid_override: Arc::new(Mutex::new(None)),
             nosync_marker: PhantomData,
         }
     }
@@ -1222,6 +1233,10 @@ impl OsIpcSender {
     }
 
     fn get_pipe_server_process_id(&self) -> Result<winapi::shared::ntdef::ULONG,WinError> {
+        let pid_override = self.pid_override.lock().unwrap();
+        if let Some(pid) = *pid_override {
+            return Ok(pid);
+        }
         unsafe {
             let mut server_pid: winapi::shared::ntdef::ULONG = 0;
             if winapi::um::winbase::GetNamedPipeServerProcessId(self.handle.as_raw(), &mut server_pid) == FALSE {
@@ -1304,6 +1319,11 @@ impl OsIpcSender {
                 OsIpcChannel::Receiver(r) => {
                     if r.prepare_for_transfer()? == false {
                         panic!("Sending receiver with outstanding partial read buffer, noooooo!  What should even happen?");
+                    }
+
+                    if let Some(pid_override) = &r.sender_pid_override {
+                        let mut pid_override = pid_override.lock().unwrap();
+                        *pid_override = Some(server_pid);
                     }
 
                     let handle = r.reader.into_inner().handle.take();
