@@ -9,6 +9,7 @@
 
 use serde;
 use bincode;
+use winapi::um::processthreadsapi::GetCurrentProcessId;
 use crate::ipc;
 
 use libc::intptr_t;
@@ -27,6 +28,7 @@ use std::ops::{Deref, DerefMut, RangeFrom};
 use std::ptr;
 use std::ptr::null_mut;
 use std::slice;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -154,17 +156,16 @@ impl<'data> Message<'data> {
         &self.bytes[(mem::size_of::<MessageHeader>() + self.data_len)..]
     }
 
-    fn oob_data(&self) -> Option<OutOfBandMessage> {
+    fn oob_data(&self, current_pid: u32) -> Option<OutOfBandMessage> {
         if self.oob_len > 0 {
-
             let oob = bincode::deserialize::<OutOfBandMessage>(self.oob_bytes())
                 .expect("Failed to deserialize OOB data");
-            if oob.target_process_id != *CURRENT_PROCESS_ID {
+            if oob.target_process_id != current_pid {
                 panic!("Windows IPC channel received handles intended for pid {}, but this is pid {}. \
                        This likely happened because a receiver was transferred while it had outstanding data \
                        that contained a channel or shared memory in its pipe. \
                        This isn't supported in the Windows implementation.",
-                       oob.target_process_id, *CURRENT_PROCESS_ID);
+                       oob.target_process_id, current_pid);
             }
             Some(oob)
         } else {
@@ -492,6 +493,10 @@ struct MessageReader {
     ///
     /// `None` if this `MessageReader` is not part of any set.
     entry_id: Option<u64>,
+
+    // Required due to limitations in Windows API to properly know when a channel changes owner
+    // this ids is extracted from the IpcReceiver that holds it.
+    receiver_pid: Arc<Mutex<u32>>,
 }
 
 // We need to explicitly declare this, because of the raw pointer
@@ -514,12 +519,13 @@ impl Drop for MessageReader {
 }
 
 impl MessageReader {
-    fn new(handle: WinHandle) -> MessageReader {
+    fn new(handle: WinHandle,  receiver_pid: Arc<Mutex<u32>>) -> MessageReader {
         MessageReader {
             handle: handle,
             read_buf: Vec::new(),
             r#async: None,
             entry_id: None,
+            receiver_pid
         }
     }
 
@@ -528,7 +534,7 @@ impl MessageReader {
         // because of the initialisation of things that won't be used.
         // Moving the data items of `MessageReader` into an enum will fix this,
         // as that way we will be able to just define a data-less `Invalid` case.
-        mem::replace(self, MessageReader::new(WinHandle::invalid()))
+        mem::replace(self, MessageReader::new(WinHandle::invalid(), self.receiver_pid.clone()))
     }
 
     /// Request the kernel to cancel a pending async I/O operation on this reader.
@@ -821,7 +827,7 @@ impl MessageReader {
             let mut shmems: Vec<OsIpcSharedMemory> = vec![];
             let mut big_data = None;
 
-            if let Some(oob) = message.oob_data() {
+            if let Some(oob) = message.oob_data(self.receiver_pid.lock().unwrap().clone()) {
                 win32_trace!("[$ {:?}] msg with total {} bytes, {} channels, {} shmems, big data handle {:?}",
                      self.handle, message.data_len, oob.channel_handles.len(), oob.shmem_handles.len(),
                      oob.big_data_receiver_handle);
@@ -990,6 +996,7 @@ enum BlockingMode {
 
 #[derive(Debug)]
 pub struct OsIpcReceiver {
+    pid: Arc<Mutex<u32>>,
     /// The receive handle and its associated state.
     ///
     /// We can't just deal with raw handles like in the other platform back-ends,
@@ -1011,10 +1018,19 @@ impl PartialEq for OsIpcReceiver {
 }
 
 impl OsIpcReceiver {
-    fn from_handle(handle: WinHandle) -> OsIpcReceiver {
+   fn from_handle(handle: WinHandle) -> OsIpcReceiver {
+        let pid = Arc::new(Mutex::new(unsafe {
+            winapi::um::processthreadsapi::GetCurrentProcessId()
+        }));
         OsIpcReceiver {
-            reader: RefCell::new(MessageReader::new(handle)),
+            reader: RefCell::new(MessageReader::new(handle, pid.clone())),
+            pid,
         }
+    }
+
+
+    pub fn change_pid(&mut self, pid: u32) {
+        self.pid = Arc::new(Mutex::new(pid));
     }
 
     fn new_named(pipe_name: &CString) -> Result<OsIpcReceiver,WinError> {
@@ -1034,8 +1050,13 @@ impl OsIpcReceiver {
                 return Err(WinError::last("CreateNamedPipeA"));
             }
 
+            let pid = Arc::new(Mutex::new(
+                winapi::um::processthreadsapi::GetCurrentProcessId(),
+            ));
+
             Ok(OsIpcReceiver {
-                reader: RefCell::new(MessageReader::new(WinHandle::new(handle))),
+                reader: RefCell::new(MessageReader::new(WinHandle::new(handle), pid.clone())),
+                pid
             })
         }
     }
@@ -1170,6 +1191,9 @@ impl OsIpcReceiver {
 #[cfg_attr(feature = "windows-shared-memory-equality", derive(PartialEq))]
 pub struct OsIpcSender {
     handle: WinHandle,
+    // NOTE: In the receiver this is not an option because here there is no way to pass it to the function "from_handle"
+    // without changing too much code
+    pid: Option<Arc<Mutex<u32>>>,
     // Make sure this is `!Sync`, to match `mpsc::Sender`; and to discourage sharing references.
     //
     // (Rather, senders should just be cloned, as they are shared internally anyway --
@@ -1179,7 +1203,13 @@ pub struct OsIpcSender {
 
 impl Clone for OsIpcSender {
     fn clone(&self) -> OsIpcSender {
-        OsIpcSender::from_handle(dup_handle(&self.handle).unwrap())
+        let pid = match &self.pid {
+            Some(server_pid) => server_pid.lock().unwrap().clone(),
+            None => unsafe { GetCurrentProcessId() },
+        };
+        let mut sender = OsIpcSender::from_handle(dup_handle(&self.handle).unwrap());
+        sender.pid = Some(Arc::new(Mutex::new(pid)));
+        sender
     }
 }
 
@@ -1187,6 +1217,10 @@ impl OsIpcSender {
     pub fn connect(name: String) -> Result<OsIpcSender,WinError> {
         let pipe_name = make_pipe_name(&Uuid::parse_str(&name).unwrap());
         OsIpcSender::connect_named(&pipe_name)
+    }
+
+    pub fn change_pid(&mut self, pid: winapi::shared::ntdef::ULONG) {
+        self.pid = Some(Arc::new(Mutex::new(pid)));
     }
 
     pub fn get_max_fragment_size() -> usize {
@@ -1197,6 +1231,7 @@ impl OsIpcSender {
         OsIpcSender {
             handle: handle,
             nosync_marker: PhantomData,
+            pid: None
         }
     }
 
@@ -1234,6 +1269,8 @@ impl OsIpcSender {
     fn get_pipe_server_process_handle_and_pid(&self) -> Result<(WinHandle, winapi::shared::ntdef::ULONG),WinError> {
         unsafe {
             let server_pid = self.get_pipe_server_process_id()?;
+            // NOTE: it is commented because when called at the setup of the app, it has value of None so crashes
+            // let server_pid = self.pid.as_ref().unwrap().lock().unwrap().clone();
             if server_pid == *CURRENT_PROCESS_ID {
                 return Ok((WinHandle::new(CURRENT_PROCESS_HANDLE.as_raw()), server_pid));
             }

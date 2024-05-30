@@ -254,6 +254,11 @@ impl<T> IpcReceiver<T> where T: for<'de> Deserialize<'de> + Serialize {
             .map_err(IpcError::Bincode)
     }
 
+    pub fn change_pid(&mut self, pid: u32) {
+        self.os_receiver.change_pid(pid);
+    }
+
+
     /// Non-blocking receive
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         let (data, os_ipc_channels, os_ipc_shared_memory_regions) =
@@ -351,6 +356,10 @@ impl<T> IpcSender<T> where T: Serialize {
             os_sender: OsIpcSender::connect(name)?,
             phantom: PhantomData,
         })
+    }
+    
+    pub fn change_pid(&mut self, pid: u32) {
+        self.os_sender.change_pid(pid);
     }
 
     /// Send data across the channel to the receiver.
