@@ -1195,7 +1195,9 @@ impl PartialEq for OsIpcSender {
 
 impl Clone for OsIpcSender {
     fn clone(&self) -> OsIpcSender {
-        OsIpcSender::from_handle(dup_handle(&self.handle).unwrap())
+        let mut result = OsIpcSender::from_handle(dup_handle(&self.handle).unwrap());
+        result.pid_override = Arc::clone(&self.pid_override);
+        result
     }
 }
 
