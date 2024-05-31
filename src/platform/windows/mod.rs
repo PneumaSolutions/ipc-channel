@@ -1176,7 +1176,6 @@ impl OsIpcReceiver {
 }
 
 #[derive(Debug)]
-#[cfg_attr(feature = "windows-shared-memory-equality", derive(PartialEq))]
 pub struct OsIpcSender {
     handle: WinHandle,
     pid_override: PidOverride,
@@ -1185,6 +1184,13 @@ pub struct OsIpcSender {
     // (Rather, senders should just be cloned, as they are shared internally anyway --
     // another layer of sharing only adds unnecessary overhead...)
     nosync_marker: PhantomData<Cell<()>>,
+}
+
+#[cfg(feature = "windows-shared-memory-equality")]
+impl PartialEq for OsIpcSender {
+    fn eq(&self, other: &OsIpcSender) -> bool {
+        self.handle == other.handle
+    }
 }
 
 impl Clone for OsIpcSender {
