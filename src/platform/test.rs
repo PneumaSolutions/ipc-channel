@@ -741,6 +741,36 @@ fn cross_process_sender_transfer_spawn() {
                (data, vec![], vec![]));
 }
 
+#[cfg(not(any(feature = "force-inprocess", target_os = "android", target_os = "ios")))]
+#[test]
+fn cross_process_receiver_transfer_spawn() {
+    let data: &[u8] = b"foo";
+    let channel_name = get_channel_name_arg("server");
+    if let Some(channel_name) = channel_name {
+        let super_tx = OsIpcSender::connect(channel_name).unwrap();
+        let (sub_tx, sub_rx) = platform::channel().unwrap();
+        super_tx.send(data, vec![OsIpcChannel::Receiver(sub_rx)], vec![]).unwrap();
+        let shmem_data = OsIpcSharedMemory::from_byte(0xba, 1024 * 1024);
+        sub_tx.send(data, vec![], vec![shmem_data]).unwrap();
+
+        unsafe { libc::exit(0); }
+    }
+
+    let (server, name) = OsIpcOneShotServer::new().unwrap();
+    let mut child_pid = spawn_server("cross_process_receiver_transfer_spawn", &[("server", &*name)]);
+
+    let (_, _, mut received_channels, _) = server.accept().unwrap();
+    assert_eq!(received_channels.len(), 1);
+    let sub_rx = received_channels[0].to_receiver();
+
+    let (received_data, received_channels, received_shared_memory) =
+        sub_rx.recv().unwrap();
+    child_pid.wait().expect("failed to wait on child");
+    assert_eq!((&received_data[..], received_channels), (data, Vec::new()));
+    assert_eq!(received_shared_memory[0].len(), 1024 * 1024);
+    assert!(received_shared_memory[0].iter().all(|byte| *byte == 0xba));
+}
+
 #[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
 #[test]
 fn cross_process_sender_transfer_fork() {
